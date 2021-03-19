@@ -1,11 +1,13 @@
 #!/bin/sh
 
-#echo g++ -g -o finddup finddup.osx.cpp -lssl
-#g++ -g -o finddup finddup.osx.cpp -lssl
+# OLD using gcc
+#echo g++ -g -o finddup finddup.cpp -lssl
+#g++ -g -o finddup finddup.cpp -lssl
 
+# We now use clang
 compiler=clang++
-exe=finddup.osx.exe
-src=finddup.osx.cpp
+exe=finddup
+src=finddup.cpp
 libpaths=$(pkg-config --libs --cflags libssl)
 #flags='-g -std=c++11'
 flags='-O2 -std=c++11'
