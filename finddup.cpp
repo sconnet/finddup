@@ -2,27 +2,29 @@
    finddup - find duplicate files
    Copyright (c) 2004-2021 Steve Connet. All Rights Reserved.
 
-   This program will perform an md5 checksum of all the files in the specified
-   directory tree. It will print the duplicate files.
+   This program will employ a set of heuristics to find duplicate files at the
+   path specified by the user and display them to stdout.
 
    HEURISTICS
-   1. Search for same file size; if match goto step 2
-   2. Search first 64 bytes of file; if match goto step 3
-   3. Search last 64 bytes of file; if match goto step 4
-   4. Perform SHA1; if match record duplicate
+       1. Search for same file size; if match goto step 2
+       2. Search first 64 bytes of file; if match goto step 3
+       3. Search last 64 bytes of file; if match goto step 4
+       4. Perform SHA1; if match record duplicate
 
-   Compile with:
-   g++ -O2 -o finddup finddup.cpp -lssl
-   gcc -O2 -o finddup finddup.cpp -lssl -lc
+   Compile with (OLD):
+       g++ -O2 -o finddup finddup.cpp -lssl
+       gcc -O2 -o finddup finddup.cpp -lssl -lc
 
-   MacOS now uses clang. Compile with:
-   clang++ -O2 -std=c++11 -o finddup finddup.cpp \
-   $(pkg-config --libs --cflags libssl)
+   MacOS now uses clang. Compile with (NEW):
+       clang++ -O2 -std=c++11 -o finddup finddup.cpp \
+       $(pkg-config --libs --cflags libssl)
 
-
-HISTORY:
+------------------------------------------------------------------------------
+HISTORY LOG:
+------------------------------------------------------------------------------
 2014-06-15 - updated for osx uses sha1 instead of deprecated md5
 2021-03-13 - filter using heuristics
+------------------------------------------------------------------------------
 */
 
 #include <iostream>
@@ -50,13 +52,13 @@ HISTORY:
 #endif
 
 char const *const version =
-"finddup v1.2  Copyright (c) 2014-2021 Steve Connet. All Rights Reserved.";
+"finddup v1.2  Copyright (c) 2014-2021 Steve Connet.  All Rights Reserved.";
 
 char const *const usage =
 "Usage is: finddup [OPTIONS] PATH\n"
 "            -r    recurse into subdirs\n"
 "            -q    quiet mode (overrides -s)\n"
-"            -s    show files being scanned\n"
+"            -s    suppress displaying files being scanned\n"
 "            -V    version\n"
 "            -h    help\n"
 "            -u    usage\n";
@@ -64,7 +66,7 @@ char const *const usage =
 #define NONE     0x0000
 #define RECURSE  0x0001  // recurse into subdirs
 #define QUIET    0x0002  // suppress verbosity
-#define SHOWSCAN 0x0004  // display file being scanned
+#define SUPPRESS 0x0004  // display file being scanned
 
 // needs to be evenly divisible by 4
 #define MATCH_BYTES    (64)
@@ -183,6 +185,7 @@ BottomMatchDB bottom_db;
 DigestDB digest_db;
 
 std::string clearstr;
+char *file_content = NULL;
 
 /*-----------------------------------------------------------------------------
  *  Class Stopwatch - measured elapsed time
@@ -297,7 +300,7 @@ std::string Stopwatch::elapsedStr()
     oss << total << units;
 
     // make plural if needed
-    if (total > 1)
+    if (0 == total || total > 1)
     {
         oss << 's';
     }
@@ -318,6 +321,9 @@ void clearLine(std::ostream &out)
 /*-----------------------------------------------------------------------------
  *  function calcChecksum
  *
+ * Simple dword checksum on 64 bytes of the file
+ *
+ * TODO: measure which is faster: this checksum, or just compare all 64 bytes
  *-----------------------------------------------------------------------------
  */
 size_t calcChecksum(char const *data, size_t bytes)
@@ -339,9 +345,10 @@ size_t calcChecksum(char const *data, size_t bytes)
 }
 
 /*-----------------------------------------------------------------------------
- *  function fileOpen
+ *  function candidates
  *
- *  Prints an error to stderr if file open failed
+ *  Return the number of vectors in this container that have more than one (1)
+ *  element. These are candidates for being duplicates.
  *
  *-----------------------------------------------------------------------------
  */
@@ -375,7 +382,7 @@ FILE *fileOpen(const char *file, const char *mode)
     if (NULL == f)
     {
         std::cerr << "Skipping and excluding file " << file
-            << " due to an open error. REF 1. ";
+            << " due to an open error. (REF 1) ";
         if (errno != 0)
         {
             std::cerr << strerror(errno);
@@ -418,8 +425,8 @@ std::string smartSizeStr(size_t bytes)
     size_t const pebibyte  = (1UL << 50); // 50 bits
     size_t const exbibyte  = (1UL << 60); // 60 bits
 #if 0
-    size_t const zebibytes = (1 << 70); // 70 bits
-    size_t const yeibyte   = (1 << 80); // 80 bits
+    size_t const zebibytes = (1UL << 70); // 70 bits
+    size_t const yeibyte   = (1UL << 80); // 80 bits
 #endif
 
     std::ostringstream oss;
@@ -476,15 +483,14 @@ std::string smartSizeStr(size_t bytes)
 /*-----------------------------------------------------------------------------
  *  function performDigest
  *
- * Calculate digest on this filel and add to the digest list.
+ * Calculate digest on this file and add to the digest list.
  *
  *-----------------------------------------------------------------------------
  */
 void performDigest(char const *file, size_t size, size_t index)
 {
-    char md_value[SHA_DIGEST_LENGTH];
+    unsigned char cksum[SHA_DIGEST_LENGTH];
     size_t max_allocated_size = 0;
-    char *data = NULL;
 
     FILE *f = fileOpen(file, "rb");
     if (f != NULL)
@@ -493,14 +499,15 @@ void performDigest(char const *file, size_t size, size_t index)
         if (size > max_allocated_size)
         {
             max_allocated_size = size;
-            if (NULL == data)
+            if (NULL == file_content)
             {
-                data = new (std::nothrow) char[size];
-                if (NULL == data)
+                // keep this allocate until the end of the program
+                file_content = new (std::nothrow) char[size];
+                if (NULL == file_content)
                 {
                     std::cerr << "Skipping and excluding file "
                         << file << " due to a memory allocation error."
-                        << " Failed to allocate " << size << " bytes. REF 2.";
+                        << " Failed to allocate " << size << " bytes. (REF 2)";
                     if (errno != 0)
                     {
                         std::cerr << strerror(errno);
@@ -510,13 +517,15 @@ void performDigest(char const *file, size_t size, size_t index)
             }
             else
             {
-                data = reinterpret_cast<char *>(realloc(data, size));
-                if (NULL == data)
+                // allocate more memory
+                file_content = reinterpret_cast<char *>(realloc(file_content,
+                            size));
+                if (NULL == file_content)
                 {
                     std::cerr << "Skipping and excluding file "
                         << file << " due to a memory reallocation error."
                         << " Failed to reallocate " << size
-                        << " bytes. REF 3.";
+                        << " bytes. (REF 3)";
                     if (errno != 0)
                     {
                         std::cerr << strerror(errno);
@@ -527,12 +536,12 @@ void performDigest(char const *file, size_t size, size_t index)
         }
 
         // read entire file into CPU RAM
-        size_t bytes = fread(data, 1, size, f);
+        size_t bytes = fread(file_content, 1, size, f);
         if (bytes != size)
         {
             std::cerr << "Skipping and excluding file " << file
                 << " due to a read error. Read " << bytes << " bytes"
-                << " but expected to read " << size << " bytes. REF 4.";
+                << " but expected to read " << size << " bytes. (REF 4)";
             if (errno != 0)
             {
                 std::cerr << strerror(errno);
@@ -543,10 +552,18 @@ void performDigest(char const *file, size_t size, size_t index)
         {
             // extern unsigned char *CC_SHA1(const void *data, CC_LONG len,
             // unsigned char *md);
-            CC_SHA1(data, size, reinterpret_cast<unsigned char *>(md_value));
+            CC_SHA1(file_content, size, cksum);
 
-            // put in digest
-            std::string digest_str(md_value);
+            // convert to human readable form or else the binary may have a
+            // NULL character in it which would concatenate when making it a
+            // string
+            std::string digest_str = "";
+            char c[3];
+            for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
+            {
+                sprintf(c, "%02x", cksum[i]);
+                digest_str += c[0] + c[1];
+            }
 
             // create new index list if this isn't already in the digest
             if (digest_db.find(digest_str) == digest_db.end())
@@ -561,9 +578,6 @@ void performDigest(char const *file, size_t size, size_t index)
 
         fclose(f);
     }
-
-    delete []data;
-    data = NULL;
 }
 
 /*-----------------------------------------------------------------------------
@@ -592,8 +606,8 @@ bool scanPath(char const *path)
         while (dirent != NULL)
         {
             // skip files . and ..
-            if ((strcmp(".", dirent->d_name) != 0) &&
-                    (strcmp("..", dirent->d_name) != 0))
+            if ((strcmp(".",  dirent->d_name) != 0) &&
+                (strcmp("..", dirent->d_name) != 0))
             {
                 // create full pathname
                 std::string pathname = path;
@@ -601,12 +615,12 @@ bool scanPath(char const *path)
                 pathname += dirent->d_name;
 
                 // let user know what we are doing
-                if (!(options & QUIET) && (options & SHOWSCAN))
+                if (!(options & QUIET) && (!(options & SUPPRESS)))
                 {
                     clearLine(std::cerr);
                     oss.str("");
-                    oss << "Scanning " << path;
-                    //                    oss << "Scanning " << pathname;
+                    // oss << "Scanning " << pathname;
+                    oss << "Scanning " << dirent->d_name;
                     std::cerr << oss.str() << std::flush;
                     clearstr = std::string(oss.str().size(), ' ');
                 }
@@ -620,7 +634,7 @@ bool scanPath(char const *path)
                     break;
                 }
 
-                // S_ISLNK(m)  symbolic link?  (Not in POSIX.1-1996.)
+                // S_ISLNK(m) - Not in POSIX.1-1996.
                 // skip symlinks (count them for metrics)
                 if (!(options & QUIET) && S_ISLNK(buf.st_mode))
                 {
@@ -649,7 +663,8 @@ bool scanPath(char const *path)
                 {
                     if (!(options & QUIET))
                     {
-                        // collect some interesting metrics
+                        // Collect some interesting metrics - not required to
+                        // find duplicates - this is informational only.
                         total_bytes_in_path += buf.st_size;
                         if (buf.st_size > max_file_sz)
                         {
@@ -693,7 +708,8 @@ bool scanPath(char const *path)
                 }
                 else
                 {
-                    // skip dirs if not recurse and skip symbolic links
+                    // skip dirs if not recurse and skip symbolic links - but
+                    // don't display these
                     //printf("Skipping %lld %s.\n", buf.st_size, pathname.c_str());
                 }
             }
@@ -704,7 +720,7 @@ bool scanPath(char const *path)
         } // while
     }
 
-    if (!(options & QUIET) && (options & SHOWSCAN))
+    if (!(options & QUIET) && (!(options & SUPPRESS)))
     {
         clearLine(std::cerr);
     }
@@ -757,7 +773,7 @@ void scanTopBytes(void)
                         std::cerr << "Skipping and excluding file "
                             << file << " due to a read error. Read "
                             << bytes << " bytes but expected to read "
-                            << MATCH_BYTES << " bytes. REF 5.";
+                            << MATCH_BYTES << " bytes. (REF 5)";
                         if (errno != 0)
                         {
                             std::cerr << strerror(errno);
@@ -835,7 +851,7 @@ void scanBottomBytes(void)
                     if (ok != 0)
                     {
                         std::cerr << "Skipping and excluding file "
-                            << file << " due to a fseeko error. REF 6.";
+                            << file << " due to a fseeko error. (REF 6)";
                         if (errno != 0)
                         {
                             std::cerr << strerror(errno);
@@ -850,7 +866,7 @@ void scanBottomBytes(void)
                             std::cerr << "Skipping and excluding file "
                                 << file << " due to a read error. Read "
                                 << bytes << " bytes but expected to read "
-                                << MATCH_BYTES << " bytes. REF 7.";
+                                << MATCH_BYTES << " bytes. (REF 7)";
                             if (errno != 0)
                             {
                                 std::cerr << strerror(errno);
@@ -913,7 +929,7 @@ bool processArguments(int argc, char *argv[])
                 break;
 
             case 's':
-                options |= SHOWSCAN;
+                options |= SUPPRESS;
                 break;
 
             case 'V':
@@ -1089,7 +1105,7 @@ bool search(char const *path)
             if (num_bottom_db > 0)
             {
                 std::cout << "After running stage 4 filter, "
-                    << num_digest_db << " candidates remain.\n" << std::endl;
+                    << num_digest_db << " candidates remain." << std::endl;
             }
 
             std::cout << "This filter took " << sw.elapsedStr() << std::endl;
@@ -1121,7 +1137,6 @@ bool search(char const *path)
                 {
                     auto index = *q;
                     std::string const &file = path_list[index];
-
                     std::cout << file << std::endl;
                 }
             }
@@ -1158,13 +1173,16 @@ int main(int argc, char *argv[])
         {
             // start the search for duplicates
             result = search(path);
-        }
-    }
 
-    if (result != EXIT_FAILURE)
-    {
-        std::cout << "This scan took " << sw.elapsedStr() << ".\n"
-            << std::endl;
+            if (result != EXIT_FAILURE)
+            {
+                std::cout << "This scan took " << sw.elapsedStr() << std::endl;
+            }
+
+            // delete any allocated data we used to read in files
+            delete []file_content;
+            file_content = NULL;
+        }
     }
 
     return result;
